@@ -19,16 +19,21 @@ jobs:
         with:
           repository: CAICAIIs/caicaiis.cc
           token: ${{ secrets.GH_TOKEN_FOR_CHECKOUT }}
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
+
       - name: Install pnpm
         run: npm install -g pnpm
+
       - name: Install dependencies
         run: pnpm install
+
       - name: Build
         run: pnpm run build
+
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
         with:
