@@ -1,4 +1,686 @@
-<?xml version="1.0" encoding="UTF-8"?><rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/"><channel><title>CAICAIIs</title><description>愚者在月影之中怀抱虚妄</description><link>https://caicaiis.cc</link><item><title>2025 年度总结</title><link>https://caicaiis.cc/2/summary</link><guid>10-50</guid><description>兜兜转转又一年</description><pubDate>Wed, 31 Dec 2025 00:00:00 GMT</pubDate><content:encoded>&lt;p&gt;&lt;img src=&quot;https://raw.githubusercontent.com/CAICAIIs/CAICAIIs.cc/refs/heads/main/src/content/post/2/summary/attachments/nijika.jpg&quot; alt=&quot;alt text&quot;&gt;
+<?xml version="1.0" encoding="UTF-8"?><rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/"><channel><title>CAICAIIs</title><description>愚者在月影之中怀抱虚妄</description><link>https://caicaiis.cc</link><item><title>开源贡献经验分享之——指数规避（ExponentialBackoff）</title><link>https://caicaiis.cc/3/exponentialbackoff</link><guid>10-50</guid><description>贡献经历的一次小分享喵~</description><pubDate>Sun, 01 Feb 2026 00:00:00 GMT</pubDate><content:encoded>&lt;p&gt;&lt;img src=&quot;https://raw.githubusercontent.com/CAICAIIs/CAICAIIs.cc/refs/heads/main/src/content/post/3/exponentialbackoff/attachments/tietie.jpg&quot; alt=&quot;alt text&quot;&gt;&lt;/p&gt;
+&lt;p&gt;一直拖着拖着终于起稿这篇博文啦，原本想一月份写的，结果都二月份了&lt;/p&gt;
+&lt;p&gt;仅是记录我在一次项目贡献时候的一点经历、经验，以后应该还会有类似的好几期，尽情期待（鸽鸽鸽）&lt;/p&gt;
+&lt;p&gt;接下来我们结合我长期参与的开源项目（dubbo-go）的具体场景来讲下我所使用的指数退避与抖动的方案&lt;/p&gt;
+&lt;h2&gt;背景&lt;/h2&gt;
+&lt;h3&gt;问题描述&lt;/h3&gt;
+&lt;p&gt;在 dubbo-go 集群中，当多个 consumer（服务消费方） 节点检测到某些 provider（服务提供方） 故障（或超时）后，这些 consumer 会在同一时刻向其他存活的 provider（或等故障 provider 恢复后）发起重试。如果我们使用的是&lt;strong&gt;固定间隔&lt;/strong&gt;呢？那么这些重试请求会同步到达，形成重试风暴。&lt;/p&gt;
+&lt;p&gt;如果这么说有点抽象的话，那么简单的说就是比如有一个人找你帮忙你觉得 ok，2 个人同时找你也还行，那要是同时有 10 个人找你帮忙那你一定受不了。那要是我们适当分散他们的请求，帮完一个再去听下一个，并每次帮忙之间给你的休息时间越来越多呢？&lt;/p&gt;
+&lt;h3&gt;具体代码分析&lt;/h3&gt;
+&lt;p&gt;我们来看 dubbo-go 项目之前的代码：&lt;/p&gt;
+&lt;pre&gt;&lt;code class=&quot;language-go&quot;&gt;// cluster/cluster/failback/cluster_invoker.go:92-117
+func (invoker *failbackClusterInvoker) process(ctx context.Context) {
+    invoker.ticker = time.NewTicker(time.Second * 1)
+    for range invoker.ticker.C {
+        for {
+            retryTask := value.(*retryTimerTask)
+            // 问题：固定5秒判断
+            if time.Since(retryTask.lastT).Seconds() &amp;lt; 5 {
+                break
+            }
+            // 所有超过5秒的任务同时出队
+            invoker.taskList.Get(1)
+            go invoker.tryTimerTaskProc(ctx, retryTask)
+        }
+    }
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;可以看到项目之前采用的就是&lt;strong&gt;固定间隔&lt;/strong&gt;的方法&lt;/p&gt;
+&lt;p&gt;而我们不妨用这段代码进行压测来验证问题是否存在，结合 AI 来帮我们写下测试代码（可以直接跳过看结果）：&lt;/p&gt;
+&lt;pre&gt;&lt;code class=&quot;language-go&quot;&gt;// TestRetryStormProblem 演示固定间隔重试导致的&amp;quot;重试风暴&amp;quot;问题
+func TestRetryStormProblem(t *testing.T) {
+	fmt.Println(&amp;quot;场景：100个请求同时失败，使用固定5秒间隔重试&amp;quot;)
+	fmt.Println()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	// 创建 mock invoker，记录调用次数
+	var invokeCount atomic.Int64
+	invoker := mock.NewMockInvoker(ctrl)
+
+	extension.SetLoadbalance(&amp;quot;random&amp;quot;, random.NewRandomLoadBalance)
+
+	invoker.EXPECT().GetURL().Return(failbackUrl).AnyTimes()
+	invoker.EXPECT().IsAvailable().Return(true).AnyTimes()
+
+	// 模拟服务持续失败
+	invoker.EXPECT().Invoke(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(ctx context.Context, inv any) *result.RPCResult {
+			count := invokeCount.Add(1)
+			return &amp;amp;result.RPCResult{
+				Err: perrors.Errorf(&amp;quot;service unavailable (invoke #%d)&amp;quot;, count),
+			}
+		},
+	).AnyTimes()
+
+	clusterInvoker := registerFailback(invoker).(*failbackClusterInvoker)
+	defer clusterInvoker.Destroy()
+
+	// 模拟100个请求同时失败
+	failureCount := 100
+	var wg sync.WaitGroup
+	startTime := time.Now()
+
+	fmt.Printf(&amp;quot;[%s] 开始发送 %d 个请求...\n&amp;quot;, time.Now().Format(&amp;quot;15:04:05.000&amp;quot;), failureCount)
+
+	for i := 0; i &amp;lt; failureCount; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			inv := invocation.NewRPCInvocation(&amp;quot;test&amp;quot;, []interface{}{}, nil)
+			clusterInvoker.Invoke(context.Background(), inv)
+		}(i)
+	}
+
+	wg.Wait()
+	initialInvokeCount := invokeCount.Load()
+	fmt.Printf(&amp;quot;[%s] 初始调用完成，失败次数: %d\n\n&amp;quot;, time.Now().Format(&amp;quot;15:04:05.000&amp;quot;), initialInvokeCount)
+
+	// 监控重试行为（观察12秒，足够看到2轮重试）
+	fmt.Println(&amp;quot;监控重试行为（观察12秒）：&amp;quot;)
+	fmt.Println(&amp;quot;时间点\t\t累计调用\t本轮调用\t问题分析&amp;quot;)
+	fmt.Println(&amp;quot;---------------------------------------------------------------&amp;quot;)
+
+	lastCount := initialInvokeCount
+	retryWaves := make([]int64, 0)
+
+	for i := 0; i &amp;lt; 12; i++ {
+		time.Sleep(1 * time.Second)
+		currentCount := invokeCount.Load()
+		delta := currentCount - lastCount
+
+		if delta &amp;gt; 0 {
+			retryWaves = append(retryWaves, delta)
+			problem := &amp;quot;&amp;quot;
+			if delta &amp;gt; 50 {
+				problem = &amp;quot;⚠️  重试风暴！大量请求同时重试&amp;quot;
+			} else if delta &amp;gt; 10 {
+				problem = &amp;quot;⚠️  重试压力较大&amp;quot;
+			}
+			fmt.Printf(&amp;quot;%ds\t\t%d\t\t%d\t\t%s\n&amp;quot;, i+1, currentCount, delta, problem)
+		}
+		lastCount = currentCount
+	}
+
+	// 分析结果
+	fmt.Println(&amp;quot;\n========================================&amp;quot;)
+	fmt.Println(&amp;quot;=== 问题分析 ===&amp;quot;)
+	fmt.Println(&amp;quot;========================================&amp;quot;)
+	fmt.Printf(&amp;quot;总执行时间: %v\n&amp;quot;, time.Since(startTime))
+	fmt.Printf(&amp;quot;总调用次数: %d\n&amp;quot;, invokeCount.Load())
+	fmt.Printf(&amp;quot;重试波次数: %d\n\n&amp;quot;, len(retryWaves))
+
+	if len(retryWaves) &amp;gt; 0 {
+		fmt.Println(&amp;quot;每次重试波的请求数量:&amp;quot;)
+		for i, wave := range retryWaves {
+			fmt.Printf(&amp;quot;  第 %d 波: %d 个请求&amp;quot;, i+1, wave)
+			if wave &amp;gt; 50 {
+				fmt.Printf(&amp;quot; ⚠️  风暴级别&amp;quot;)
+			}
+			fmt.Println()
+		}
+		fmt.Println()
+	}
+
+	// 验证确实发生了重试风暴
+	assert.Greater(t, len(retryWaves), 0, &amp;quot;应该发生了重试&amp;quot;)
+	if len(retryWaves) &amp;gt; 0 {
+		maxWave := int64(0)
+		for _, wave := range retryWaves {
+			if wave &amp;gt; maxWave {
+				maxWave = wave
+			}
+		}
+		assert.Greater(t, maxWave, int64(50), &amp;quot;应该出现重试风暴（单次重试&amp;gt;50个请求）&amp;quot;)
+	}
+}
+
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;而我们测试后的结果：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;场景：100个请求同时失败，使用固定5秒间隔重试
+总执行时间：12.06秒
+总调用次数：300次
+重试波次数：4波
+重试波详情：
+- 第 1 波（6秒时）：95个请求 ⚠️ 风暴级别
+- 第 2 波（7秒时）：5个请求
+- 第 3 波（11秒时）：95个请求 ⚠️ 风暴级别
+- 第 4 波（12秒时）：5个请求
+&lt;/code&gt;&lt;/pre&gt;
+&lt;h3&gt;核心问题&lt;/h3&gt;
+&lt;ol&gt;
+&lt;li&gt;所有失败请求的 lastT 时间几乎相同（0.03秒内）&lt;/li&gt;
+&lt;li&gt;5秒后，95个任务同时满足重试条件&lt;/li&gt;
+&lt;li&gt;95个 goroutine 同时启动，形成&amp;quot;重试风暴&amp;quot;&lt;/li&gt;
+&lt;li&gt;如果服务刚恢复，会被大量重试请求再次压垮&lt;/li&gt;
+&lt;/ol&gt;
+&lt;h3&gt;影响范围&lt;/h3&gt;
+&lt;p&gt;如果在生产环境：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;服务故障时，大量请求同时失败&lt;/li&gt;
+&lt;li&gt;5秒后，所有请求同时重试&lt;/li&gt;
+&lt;li&gt;刚恢复的服务被重试风暴压垮&lt;/li&gt;
+&lt;li&gt;形成&amp;quot;雪崩效应&amp;quot;，服务无法正常恢复&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;所以我们目标就是降低这种危害的发生率！&lt;/p&gt;
+&lt;h2&gt;指数退避 + 随机抖动的原理&lt;/h2&gt;
+&lt;h3&gt;指数退避&lt;/h3&gt;
+&lt;p&gt;&lt;strong&gt;简单概括&lt;/strong&gt;：指数退避也是一种重试策略，当操作失败时，每次重试前的等待时间会按指数级增长（如 1s、2s、4s、8s...）。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;计算公式&lt;/strong&gt;：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;backoff = baseInterval × (2 ^ retries)
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;&lt;strong&gt;示例&lt;/strong&gt;：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;第1次重试：1s  = 1 × 2^0
+第2次重试：2s  = 1 × 2^1
+第3次重试：4s  = 1 × 2^2
+第4次重试：8s  = 1 × 2^3
+第5次重试：16s = 1 × 2^4
+第6次重试：32s = 1 × 2^5
+第7次重试：60s = min(64, 60) // 设置上限
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;&lt;strong&gt;优点&lt;/strong&gt;：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;自动分散重试时间&lt;/li&gt;
+&lt;li&gt;失败越多，等待越久，给服务恢复时间&lt;/li&gt;
+&lt;li&gt;避免频繁重试浪费资源&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;&lt;strong&gt;缺点&lt;/strong&gt;：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;如果100个请求同时失败，它们的重试时间仍然相同&lt;/li&gt;
+&lt;li&gt;仍可能产生&amp;quot;同步重试&amp;quot;问题&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h3&gt;随机抖动（Jitter）&lt;/h3&gt;
+&lt;p&gt;&lt;strong&gt;简单概括&lt;/strong&gt;：是在&lt;strong&gt;固定时间间隔上增加随机波动&lt;/strong&gt;的技术。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;核心思想&lt;/strong&gt;： 在退避时间基础上加入随机偏移，打破同步性。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;常见抖动策略&lt;/strong&gt;：&lt;/p&gt;
+&lt;h4&gt;策略1：Full Jitter（完全抖动）&lt;/h4&gt;
+&lt;pre&gt;&lt;code&gt;sleep = random(0, backoff)
+&lt;/code&gt;&lt;/pre&gt;
+&lt;ul&gt;
+&lt;li&gt;优点：最大程度分散重试&lt;/li&gt;
+&lt;li&gt;缺点：可能过于激进&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h4&gt;策略2：Equal Jitter（均等抖动）&lt;/h4&gt;
+&lt;pre&gt;&lt;code&gt;sleep = backoff/2 + random(0, backoff/2)
+&lt;/code&gt;&lt;/pre&gt;
+&lt;ul&gt;
+&lt;li&gt;优点：平衡分散和等待时间&lt;/li&gt;
+&lt;li&gt;缺点：实现稍复杂&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h4&gt;策略3：Decorrelated Jitter（去相关抖动）&lt;/h4&gt;
+&lt;pre&gt;&lt;code&gt;sleep = min(cap, random(base, sleep × 3))
+&lt;/code&gt;&lt;/pre&gt;
+&lt;ul&gt;
+&lt;li&gt;优点：更平滑的分布&lt;/li&gt;
+&lt;li&gt;缺点：不够直观，随机性太强难以调试&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h3&gt;指数退避+抖动组合&lt;/h3&gt;
+&lt;p&gt;考虑到我们项目的改进需要有利他人调试，并且达成我们分散重试的目的，我们可以选择 Equal Jitter 来实现，大概思路：&lt;/p&gt;
+&lt;pre&gt;&lt;code class=&quot;language-go&quot;&gt;func calculateBackoff(retries int64, baseInterval, maxInterval time.Duration) time.Duration {
+    // 指数退避
+    backoff := baseInterval * time.Duration(1&amp;lt;&amp;lt;retries)
+    if backoff &amp;gt; maxInterval {
+        backoff = maxInterval
+    }
+
+    // 均等抖动：50%固定 + 50%随机
+    half := backoff / 2
+    jitter := time.Duration(rand.Int63n(int64(half)))
+
+    return half + jitter
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;h4&gt;效果对比&lt;/h4&gt;
+&lt;p&gt;让 ai 帮我画了画&lt;/p&gt;
+&lt;p&gt;固定间隔（改进前）：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;时间轴：
+0s  ████████████████████ (100个请求失败)
+5s  ████████████████████ (95个请求同时重试) ⚠️ 风暴
+10s ████████████████████ (95个请求再次同时重试) ⚠️ 风暴
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;指数退避 + 随机抖动（改进后）：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;时间轴：
+0s  ████████████████████ (100个请求失败)
+1s  ██░░░░░░░░░░░░░░░░░░ (10-15个重试，分散在0.5-1.5s)
+2s  ░░██░░░░░░░░░░░░░░░░ (8-12个重试，分散在1-3s)
+4s  ░░░░████░░░░░░░░░░░░ (6-10个重试，分散在2-6s)
+8s  ░░░░░░░░████░░░░░░░░ (5-8个重试，分散在4-12s)
+16s ░░░░░░░░░░░░████░░░░ (剩余重试，分散在8-24s)
+&lt;/code&gt;&lt;/pre&gt;
+&lt;h3&gt;适用场景&lt;/h3&gt;
+&lt;p&gt;并非所有类似的场景都适用这个方案，而我大概列举一些仅供参考，也并不一定是相同场景下的最佳实践，还需具体情况具体分析。&lt;/p&gt;
+&lt;h4&gt;场景1：异步后台任务&lt;/h4&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;特点：&lt;/strong&gt; 非实时、允许延迟、必须送达&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;示例：&lt;/strong&gt;
+&lt;ul&gt;
+&lt;li&gt;消息通知（邮件、短信、推送）&lt;/li&gt;
+&lt;li&gt;日志记录（审计日志、操作日志）&lt;/li&gt;
+&lt;li&gt;数据同步（缓存更新、索引更新）&lt;/li&gt;
+&lt;li&gt;统计上报（用户行为、业务指标）&lt;/li&gt;
+&lt;/ul&gt;
+&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h4&gt;场景2：外部服务调用&lt;/h4&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;特点：&lt;/strong&gt; 依赖第三方、可能限流、需要重试&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;示例：&lt;/strong&gt;
+&lt;ul&gt;
+&lt;li&gt;API调用（支付接口、地图API、云服务API）&lt;/li&gt;
+&lt;li&gt;数据库连接（主从切换、网络抖动）&lt;/li&gt;
+&lt;li&gt;消息队列（消费失败重试）&lt;/li&gt;
+&lt;/ul&gt;
+&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h4&gt;场景3：资源竞争场景&lt;/h4&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;特点：&lt;/strong&gt; 高并发、资源有限、需要错峰&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;示例：&lt;/strong&gt;
+&lt;ul&gt;
+&lt;li&gt;分布式锁获取&lt;/li&gt;
+&lt;li&gt;连接池获取&lt;/li&gt;
+&lt;li&gt;限流场景下的重试&lt;/li&gt;
+&lt;/ul&gt;
+&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h3&gt;不适合使用指数退避的场景：&lt;/h3&gt;
+&lt;ol&gt;
+&lt;li&gt;&lt;strong&gt;实时性要求高：&lt;/strong&gt; 用户等待结果的场景（应该快速失败或使用 Failover）&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;瞬时故障：&lt;/strong&gt; 网络抖动（应该用固定短间隔）&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;事务操作：&lt;/strong&gt; 需要立即知道成功/失败的场景&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;强一致性要求：&lt;/strong&gt; 不能接受延迟的场景&lt;/li&gt;
+&lt;/ol&gt;
+&lt;h2&gt;项目中需要改进的模块&lt;/h2&gt;
+&lt;p&gt;结合以上分析再回归项目（dubbo-go），我大概找到了两处比较适合这个策略的地方可以改进：&lt;/p&gt;
+&lt;h4&gt;Failback 集群重试&lt;/h4&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;文件：&lt;/strong&gt; &lt;code&gt;cluster/cluster/failback/cluster_invoker.go:106&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;当前问题：&lt;/strong&gt; 固定5秒间隔，已验证存在重试风暴&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h4&gt;Nacos 注册中心订阅重试&lt;/h4&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;文件：&lt;/strong&gt; &lt;code&gt;registry/nacos/registry.go:202-213&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;当前问题：&lt;/strong&gt; 无间隔死循环重试，导致 &lt;strong&gt;CPU 100% 空转&lt;/strong&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;&lt;strong&gt;问题代码：&lt;/strong&gt;&lt;/p&gt;
+&lt;pre&gt;&lt;code class=&quot;language-go&quot;&gt;func (nr *nacosRegistry) subscribeUntilSuccess(...) {
+    for {
+        if !nr.IsAvailable() {
+            return
+        }
+        err := nr.subscribe(...)
+        if err == nil {
+            return
+        }
+        // 问题：没有 sleep，立即重试
+        // 导致 CPU 疯狂空转
+    }
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;&lt;strong&gt;问题严重性：&lt;/strong&gt;&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;指标&lt;/th&gt;
+&lt;th&gt;旧实现（无间隔）&lt;/th&gt;
+&lt;th&gt;新实现（指数退避）&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;每秒重试次数&lt;/td&gt;
+&lt;td&gt;8800 万次&lt;/td&gt;
+&lt;td&gt;5 次&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;CPU 占用&lt;/td&gt;
+&lt;td&gt;100%&lt;/td&gt;
+&lt;td&gt;~0%&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;1 小时总重试&lt;/td&gt;
+&lt;td&gt;36 亿次&lt;/td&gt;
+&lt;td&gt;130 次&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;&lt;strong&gt;CPU 监控对比：&lt;/strong&gt;&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;阶段 1（空闲）：CPU 0%&lt;/li&gt;
+&lt;li&gt;阶段 2（旧实现运行）：CPU 56-74%（单核打满）&lt;/li&gt;
+&lt;li&gt;阶段 3（新实现运行）：CPU 0.0-0.1%&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h2&gt;改进思路&lt;/h2&gt;
+&lt;h3&gt;设计原则&lt;/h3&gt;
+&lt;ol&gt;
+&lt;li&gt;&lt;strong&gt;简洁性优先：&lt;/strong&gt; 直接使用成熟的第三方库而非自己实现，降低维护成本&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;渐进式改进：&lt;/strong&gt; 先改造最需要的 Failback 模块，验证效果后再推广&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;兼容性保障：&lt;/strong&gt; 保持原有 API 不变，对现有使用者透明&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;可观测性：&lt;/strong&gt; 添加日志记录，方便问题排查&lt;/li&gt;
+&lt;/ol&gt;
+&lt;h3&gt;技术选型&lt;/h3&gt;
+&lt;p&gt;&lt;strong&gt;选择 &lt;code&gt;github.com/cenkalti/backoff/v4&lt;/code&gt;&lt;/strong&gt;&lt;/p&gt;
+&lt;p&gt;这个库是 Go 生态中最成熟的退避算法实现之一，有以下优点：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;stars 数量多，广泛使用，经过生产验证&lt;/li&gt;
+&lt;li&gt;支持多种退避策略（指数、常量等）&lt;/li&gt;
+&lt;li&gt;自带随机抖动（Randomization Factor）&lt;/li&gt;
+&lt;li&gt;API 简洁，易于集成&lt;/li&gt;
+&lt;li&gt;零依赖，不会引入额外包&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;&lt;strong&gt;配置参数：&lt;/strong&gt;&lt;/p&gt;
+&lt;pre&gt;&lt;code class=&quot;language-go&quot;&gt;backoff := backoff.NewExponentialBackOff()
+backoff.InitialInterval = 1 * time.Second      // 初始间隔 1s
+backoff.MaxInterval = 60 * time.Second          // 最大间隔 60s
+backoff.Multiplier = 1.5                        // 倍增因子（默认）
+backoff.MaxElapsedTime = 0                      // 永不超时
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;&lt;strong&gt;重试间隔演变：&lt;/strong&gt;&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;1s → 1.5s → 2.25s → 3.4s → 5s → 7.5s → ... → 60s (封顶)
+&lt;/code&gt;&lt;/pre&gt;
+&lt;h3&gt;具体实现&lt;/h3&gt;
+&lt;h4&gt;核心修改点&lt;/h4&gt;
+&lt;p&gt;&lt;strong&gt;1. 在 &lt;code&gt;retryTimerTask&lt;/code&gt; 结构体中添加 backoff 字段&lt;/strong&gt;&lt;/p&gt;
+&lt;pre&gt;&lt;code class=&quot;language-go&quot;&gt;type retryTimerTask struct {
+    invocation   protocol.Invocation
+    retries      int64
+    lastT        time.Time
+    interval     time.Duration
+    invoker      protocol.Invoker
+    invokersSuccessiveFailureTimes map[protocol.Invoker]int64
+    mu                             sync.Mutex
+
+    // 新增字段
+    nextBackoff time.Duration          // 下次重试的等待时间
+    backoff     *backoff.ExponentialBackOff  // 退避计算器
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;&lt;strong&gt;2. 修改重试检查逻辑&lt;/strong&gt;&lt;/p&gt;
+&lt;p&gt;将原来的固定 5 秒判断改为动态计算：&lt;/p&gt;
+&lt;pre&gt;&lt;code class=&quot;language-go&quot;&gt;// 改进前
+if time.Since(retryTask.lastT).Seconds() &amp;lt; 5 {
+    break
+}
+
+// 改进后
+if time.Since(retryTask.lastT) &amp;lt; retryTask.nextBackoff {
+    break
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;&lt;strong&gt;3. 在每次重试后更新 nextBackoff&lt;/strong&gt;&lt;/p&gt;
+&lt;pre&gt;&lt;code class=&quot;language-go&quot;&gt;func (invoker *failbackClusterInvoker) tryTimerTaskProc(ctx context.Context, retryTask *retryTimerTask) {
+    // ... 执行重试逻辑
+
+    // 计算下次退避时间
+    retryTask.nextBackoff = retryTask.backoff.NextBackOff()
+    if retryTask.nextBackoff == backoff.Stop {
+        logger.Infof(&amp;quot;[Failback] Backoff stopped for task, removing from queue&amp;quot;)
+        return
+    }
+
+    retryTask.retries++
+    retryTask.lastT = time.Now()
+
+    // 添加日志便于调试
+    logger.Infof(&amp;quot;[Failback] Retry #%d scheduled after %v&amp;quot;,
+        retryTask.retries, retryTask.nextBackoff)
+
+    // 放回队列继续重试
+    invoker.taskList.Put(retryTask)
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;&lt;strong&gt;4. 初始化 backoff 实例&lt;/strong&gt;&lt;/p&gt;
+&lt;pre&gt;&lt;code class=&quot;language-go&quot;&gt;func newRetryTimerTask(invocation protocol.Invocation, invoker protocol.Invoker) *retryTimerTask {
+    // 创建 backoff 实例
+    b := backoff.NewExponentialBackOff()
+    b.InitialInterval = 1 * time.Second
+    b.MaxInterval = 60 * time.Second
+    b.MaxElapsedTime = 0  // 永不超时
+
+    return &amp;amp;retryTimerTask{
+        invocation: invocation,
+        lastT:      time.Now(),
+        invoker:    invoker,
+        invokersSuccessiveFailureTimes: make(map[protocol.Invoker]int64),
+        backoff:    b,
+        nextBackoff: b.NextBackOff(),  // 获取首次退避时间
+    }
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;h4&gt;Nacos 订阅重试实现&lt;/h4&gt;
+&lt;p&gt;&lt;strong&gt;核心改动：&lt;/strong&gt;&lt;/p&gt;
+&lt;p&gt;使用 &lt;code&gt;backoff.NewExponentialBackOff()&lt;/code&gt; + &lt;code&gt;backoff.RetryNotify()&lt;/code&gt; 包装重试逻辑：&lt;/p&gt;
+&lt;pre&gt;&lt;code class=&quot;language-go&quot;&gt;func (nr *nacosRegistry) subscribeUntilSuccess(serviceName string, notifyListener registry.NotifyListener) {
+    // 创建指数退避配置
+    bo := backoff.NewExponentialBackOff()
+    bo.InitialInterval = 1 * time.Second    // 首次 1s
+    bo.MaxInterval = 30 * time.Second       // 最大 30s
+    bo.MaxElapsedTime = 0                   // 永不超时
+
+    // 定义重试操作
+    operation := func() error {
+        // 检查注册中心是否可用
+        if !nr.IsAvailable() {
+            return backoff.Permanent(errors.New(&amp;quot;registry not available&amp;quot;))
+        }
+        // 执行订阅
+        return nr.subscribe(getSubscribeName(serviceName), notifyListener)
+    }
+
+    // 定义通知函数（记录日志）
+    notify := func(err error, duration time.Duration) {
+        logger.Infof(&amp;quot;[Nacos] Subscribe failed for %s, retrying in %v: %v&amp;quot;,
+            serviceName, duration, err)
+    }
+
+    // 执行带重试的订阅
+    err := backoff.RetryNotify(operation, bo, notify)
+    if err != nil {
+        logger.Errorf(&amp;quot;[Nacos] Subscribe permanently failed for %s: %v&amp;quot;, serviceName, err)
+    }
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;&lt;strong&gt;关键点说明：&lt;/strong&gt;&lt;/p&gt;
+&lt;ol&gt;
+&lt;li&gt;&lt;strong&gt;backoff.Permanent()&lt;/strong&gt; - 用于标记不可恢复的错误（如注册中心关闭），直接停止重试&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;backoff.RetryNotify()&lt;/strong&gt; - 自动处理重试逻辑和间隔计算，简化代码&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;notify 回调&lt;/strong&gt; - 记录每次重试的时间间隔，便于排查问题&lt;/li&gt;
+&lt;/ol&gt;
+&lt;p&gt;&lt;strong&gt;配置参数：&lt;/strong&gt;&lt;/p&gt;
+&lt;pre&gt;&lt;code class=&quot;language-go&quot;&gt;InitialInterval: 1s     // 首次重试 1s
+MaxInterval: 30s        // 最大间隔 30s（比 Failback 的 60s 短）
+MaxElapsedTime: 0       // 永不超时，持续重试
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;&lt;strong&gt;重试间隔演变：&lt;/strong&gt;&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;1s → 1.5s → 2.25s → 3.4s → 5s → 7.5s → ... → 30s (封顶)
+&lt;/code&gt;&lt;/pre&gt;
+&lt;h3&gt;测试验证&lt;/h3&gt;
+&lt;h4&gt;Failback 测试&lt;/h4&gt;
+&lt;p&gt;为了确保改进有效，编写相应的测试来验证新的行为：&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;测试重点：&lt;/strong&gt;&lt;/p&gt;
+&lt;ol&gt;
+&lt;li&gt;&lt;strong&gt;验证首次重试时间约为 1 秒&lt;/strong&gt;（而非原来的 5 秒）&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;验证重试会持续进行&lt;/strong&gt;（不会因为 backoff 而停止）&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;使用原子计数器&lt;/strong&gt;避免并发问题&lt;/li&gt;
+&lt;/ol&gt;
+&lt;pre&gt;&lt;code class=&quot;language-go&quot;&gt;func TestFailbackClusterInvokerWithBackoff(t *testing.T) {
+    // ... 设置 mock
+
+    startTime := time.Now()
+
+    // 触发失败
+    clusterInvoker.Invoke(context.Background(), inv)
+
+    // 等待 2 秒观察重试
+    time.Sleep(2 * time.Second)
+
+    elapsed := time.Since(startTime)
+    retryCount := invokeCount.Load()
+
+    // 断言：首次重试应该在 ~1s 发生（允许误差 ±0.5s）
+    assert.Greater(t, elapsed, 500*time.Millisecond)
+    assert.Less(t, elapsed, 2500*time.Millisecond)
+
+    // 断言：应该至少发生了 1 次重试
+    assert.Greater(t, retryCount, int64(1))
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;h4&gt;Nacos 测试&lt;/h4&gt;
+&lt;p&gt;&lt;strong&gt;测试场景：模拟旧实现 vs 新实现的性能对比&lt;/strong&gt;&lt;/p&gt;
+&lt;pre&gt;&lt;code class=&quot;language-go&quot;&gt;func TestNacosSubscribeWithBackoff(t *testing.T) {
+    // 旧实现模拟：无间隔死循环
+    oldImplCount := atomic.Int64{}
+    stop := make(chan struct{})
+
+    go func() {
+        for {
+            select {
+            case &amp;lt;-stop:
+                return
+            default:
+                oldImplCount.Add(1)
+                // 无 sleep，疯狂空转
+            }
+        }
+    }()
+
+    // 运行 1 秒
+    time.Sleep(1 * time.Second)
+    close(stop)
+
+    oldRetries := oldImplCount.Load()
+    fmt.Printf(&amp;quot;旧实现：1秒内重试 %d 次\n&amp;quot;, oldRetries)
+
+    // 新实现模拟：指数退避
+    newImplCount := atomic.Int64{}
+    stop2 := make(chan struct{})
+
+    go func() {
+        bo := backoff.NewExponentialBackOff()
+        bo.InitialInterval = 100 * time.Millisecond
+        bo.MaxInterval = 500 * time.Millisecond
+
+        for {
+            select {
+            case &amp;lt;-stop2:
+                return
+            default:
+                interval := bo.NextBackOff()
+                newImplCount.Add(1)
+                time.Sleep(interval)
+            }
+        }
+    }()
+
+    time.Sleep(1 * time.Second)
+    close(stop2)
+
+    newRetries := newImplCount.Load()
+    fmt.Printf(&amp;quot;新实现：1秒内重试 %d 次\n&amp;quot;, newRetries)
+
+    // 验证：新实现的重试次数应该远小于旧实现
+    assert.Less(t, newRetries, oldRetries/1000000)
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;&lt;strong&gt;测试结果：&lt;/strong&gt;&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;旧实现：1秒内重试 88000000 次（8800万次）
+新实现：1秒内重试 5 次
+性能提升：减少 99.99999% 的无效重试
+&lt;/code&gt;&lt;/pre&gt;
+&lt;h3&gt;效果对比&lt;/h3&gt;
+&lt;h4&gt;Failback 集群重试效果&lt;/h4&gt;
+&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;维度&lt;/th&gt;
+&lt;th&gt;改进前（固定 5s）&lt;/th&gt;
+&lt;th&gt;改进后（指数退避）&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;首次重试&lt;/td&gt;
+&lt;td&gt;5s&lt;/td&gt;
+&lt;td&gt;1s&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;重试间隔&lt;/td&gt;
+&lt;td&gt;固定 5s&lt;/td&gt;
+&lt;td&gt;1s → 1.5s → 2.25s → ... → 60s&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;并发重试&lt;/td&gt;
+&lt;td&gt;100 个请求同时重试&lt;/td&gt;
+&lt;td&gt;分散在不同时间点&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;重试风暴&lt;/td&gt;
+&lt;td&gt;存在&lt;/td&gt;
+&lt;td&gt;基本消除&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;服务恢复&lt;/td&gt;
+&lt;td&gt;困难（持续被压垮）&lt;/td&gt;
+&lt;td&gt;容易（压力逐步恢复）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;h4&gt;Nacos 订阅重试效果&lt;/h4&gt;
+&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;维度&lt;/th&gt;
+&lt;th&gt;改进前（无间隔）&lt;/th&gt;
+&lt;th&gt;改进后（指数退避）&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;每秒重试&lt;/td&gt;
+&lt;td&gt;8800 万次&lt;/td&gt;
+&lt;td&gt;5 次&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;CPU 占用&lt;/td&gt;
+&lt;td&gt;100%&lt;/td&gt;
+&lt;td&gt;~0%&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;1 小时总重试&lt;/td&gt;
+&lt;td&gt;36 亿次&lt;/td&gt;
+&lt;td&gt;130 次&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;资源浪费&lt;/td&gt;
+&lt;td&gt;严重&lt;/td&gt;
+&lt;td&gt;几乎无&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;h3&gt;关于随机抖动&lt;/h3&gt;
+&lt;p&gt;为什么我们不需要手动添加抖动逻辑？&lt;/p&gt;
+&lt;p&gt;&lt;code&gt;backoff.ExponentialBackOff&lt;/code&gt; 内置了 &lt;strong&gt;Randomization Factor&lt;/strong&gt;（默认值 0.5），意味着：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;实际等待时间 = 计算时间 × [0.5, 1.5]
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;例如计算出的等待时间是 2 秒，实际等待可能是 1s - 3s 之间的随机值。这就是为什么即使 100 个请求同时失败，它们的重试时间也会自然分散。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;为什么这样设计很巧妙？&lt;/strong&gt;&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;避免了手动实现抖动的复杂度&lt;/li&gt;
+&lt;li&gt;让测试更稳定（不需要精确断言时间）&lt;/li&gt;
+&lt;li&gt;提供了足够的分散性来避免重试风暴&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;&lt;strong&gt;Nacos 并发安全：&lt;/strong&gt;&lt;/p&gt;
+&lt;p&gt;使用 &lt;code&gt;backoff.RetryNotify()&lt;/code&gt; 在单个 goroutine 中串行执行，天然避免了并发问题。每个订阅任务都在独立的 goroutine 中运行，互不干扰。&lt;/p&gt;
+&lt;h3&gt;PR 合并情况&lt;/h3&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;相关 PR：&lt;/strong&gt; &lt;a href=&quot;https://github.com/apache/dubbo-go/pull/3180&quot;&gt;apache/dubbo-go#3180&lt;/a&gt;、&lt;a href=&quot;https://github.com/apache/dubbo-go/pull/3178&quot;&gt;apache/dubbo-go#3178&lt;/a&gt;&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;关联 Issue：&lt;/strong&gt; &lt;a href=&quot;https://github.com/apache/dubbo-go/issues/3179&quot;&gt;#3179 - Failback 固定间隔导致重试风暴&lt;/a&gt;、&lt;a href=&quot;https://github.com/apache/dubbo-go/issues/3177&quot;&gt;#3177 - Nacos 订阅重试无间隔导致 CPU 100%&lt;/a&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h2&gt;题外话&lt;/h2&gt;
+&lt;p&gt;虽然我这篇文章是以讲这么个技术为主，但是我更希望大家能够在遇到具体的场景问题时候再去探索调研有哪些合适的技术方案，而不推荐为了用而用。&lt;/p&gt;
+&lt;p&gt;还有，如果愿意的话，欢迎一起来贡献我们 &lt;a href=&quot;https://github.com/apache/dubbo-go&quot;&gt;apache/dubbo-go&lt;/a&gt; 项目！&lt;/p&gt;
+</content:encoded><category>开源经验</category></item><item><title>2025 年度总结</title><link>https://caicaiis.cc/2/summary</link><guid>10-50</guid><description>兜兜转转又一年</description><pubDate>Wed, 31 Dec 2025 00:00:00 GMT</pubDate><content:encoded>&lt;p&gt;&lt;img src=&quot;https://raw.githubusercontent.com/CAICAIIs/CAICAIIs.cc/refs/heads/main/src/content/post/2/summary/attachments/nijika.jpg&quot; alt=&quot;alt text&quot;&gt;
 兜兜转转又一年&lt;/p&gt;
 &lt;p&gt;在 2025 年的尾声我又再次重建了 blog，虽然已经快数不清自己已经整过多少个 blog 了，但希望能坚持产出，在这个互联网的小角落中多留下自己的思考。&lt;/p&gt;
 &lt;p&gt;由于自己在今年大部分时间都是没有什么记录的习惯，所以现在回顾一年的渠道只剩下了翻相册（虽然相册也没有经过良好的整理就是了）以及查看 QQ空间 的一些碎片，悲&lt;/p&gt;
