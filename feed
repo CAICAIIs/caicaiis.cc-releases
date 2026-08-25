@@ -62,6 +62,14 @@ diagnose run
 &lt;li&gt;&lt;code&gt;diagnose run&lt;/code&gt; gives one sweep across the obvious checks.&lt;/li&gt;
 &lt;/ul&gt;
 &lt;p&gt;That is enough surface area for a first useful version. Anything bigger would have pulled the tool away from the &amp;quot;read-only helper&amp;quot; role and into a much broader admin surface.&lt;/p&gt;
+&lt;h2&gt;Related pull requests&lt;/h2&gt;
+&lt;p&gt;The work landed across two Apache repositories. These are the main GSoC pull requests behind the design described here:&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;a href=&quot;https://github.com/apache/incubator-seata-go/pull/1126&quot;&gt;incubator-seata-go #1126&lt;/a&gt;: add the discovery provider registry and address store.&lt;/li&gt;
+&lt;li&gt;&lt;a href=&quot;https://github.com/apache/incubator-seata-go/pull/1138&quot;&gt;incubator-seata-go #1138&lt;/a&gt;: wire registry change snapshots into the remoting address lifecycle.&lt;/li&gt;
+&lt;li&gt;&lt;a href=&quot;https://github.com/apache/incubator-seata-ctl/pull/21&quot;&gt;incubator-seata-ctl #21&lt;/a&gt;: add read-only diagnostics and transaction listing to &lt;code&gt;seata-ctl&lt;/code&gt;.&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;All three pull requests were merged. The links are here because the implementation details are easier to understand in the code review than in a retrospective paragraph: the Seata-Go changes explain the discovery and address-update path, while the seata-ctl change shows the user-facing diagnostic flow.&lt;/p&gt;
 &lt;h2&gt;Verification&lt;/h2&gt;
 &lt;p&gt;I checked the work with:&lt;/p&gt;
 &lt;ul&gt;
